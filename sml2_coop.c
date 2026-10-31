@@ -114,6 +114,7 @@ static SDL_GameController *s_pad2;
 /* Launcher Player 2 card: 0 none, 1 keyboard, 2 one gamepad. */
 static int s_p2_src = 1;
 static char s_p2_guid[40];
+static int s_p2_slot;
 enum { P2N = 8 };
 static int s_p2_key[P2N][2];
 static const uint8_t s_p2_bit[P2N] = {
@@ -438,6 +439,7 @@ static void restore_keys(GBContext *ctx) {
 static void p2_defaults(void) {
     s_p2_src = 1;
     s_p2_guid[0] = '\0';
+    s_p2_slot = 0;
     memset(s_p2_key, 0, sizeof s_p2_key);
     s_p2_key[0][0] = SDL_SCANCODE_I;
     s_p2_key[1][0] = SDL_SCANCODE_K;
@@ -491,6 +493,11 @@ static void load_p2_input(void) {
             snprintf(s_p2_guid, sizeof s_p2_guid, "%s", val);
             continue;
         }
+        if (strcmp(key, "input.p2.slot") == 0) {
+            int v = atoi(val);
+            if (v >= 0 && v < 8) s_p2_slot = v;
+            continue;
+        }
         if (strncmp(key, "input.p2.", 9) != 0) continue;
         const char *rest = key + 9;
         for (int b = 0; b < P2N; b++) {
@@ -534,23 +541,29 @@ static void open_pad2(void) {
     int n = SDL_NumJoysticks();
     int any_pad = -1;
     int any_joy = -1;
+    int matches[8];
+    int match_n = 0;
     for (int i = 0; i < n; i++) {
         if (SDL_IsGameController(i)) {
             if (any_pad < 0) any_pad = i;
             if (!pad_guid_matches(i)) continue;
-            s_pad2 = SDL_GameControllerOpen(i);
-            if (s_pad2) return;
+            if (match_n < 8) matches[match_n++] = i;
         } else if (any_joy < 0) {
             any_joy = i;
         }
     }
-    /* The launcher guid can miss the live device (a second driver entry).
-     * Player 1 is the keyboard, so the pad that is plugged in is player 2. */
-    if (any_pad >= 0) {
+    if (match_n > 0) {
+        int pick = s_p2_slot;
+        if (pick < 0 || pick >= match_n) pick = 0;
+        s_pad2 = SDL_GameControllerOpen(matches[pick]);
+        if (s_pad2) return;
+    }
+    /* No guid match. Player 1 on the keyboard leaves the plugged pad free. */
+    if (!s_p2_guid[0] && any_pad >= 0) {
         s_pad2 = SDL_GameControllerOpen(any_pad);
         if (s_pad2) return;
     }
-    if (any_joy >= 0) s_joy2 = SDL_JoystickOpen(any_joy);
+    if (!s_p2_guid[0] && any_joy >= 0) s_joy2 = SDL_JoystickOpen(any_joy);
 }
 
 static void held_from_axes(uint8_t *held, int ax, int ay) {
