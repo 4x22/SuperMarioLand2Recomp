@@ -120,6 +120,9 @@ static int s_on_plat = -1;
 static int s_plat_ready;
 static int s_plat_bank;
 static int s_plat_x, s_plat_y;
+/* Frames since the carrot glide last reset his fall. 00:1090 refreshes
+ * it every 12 frames while A stays held. */
+static int s_flutter_tick;
 static int s_blob_n;
 static uint16_t s_addr[BLOB_MAX];
 static Regs s_regs;
@@ -191,7 +194,7 @@ static void bind_addrs(void) {
     }
     static const uint16_t extra[] = {
         0xA24F, 0xA266, 0xA267, 0xA268, 0xA271, 0xA272,
-        0xA279, 0xA27A, 0xA284, 0xA291, 0xA299, 0xA2DC, 0xA2DE
+        0xA279, 0xA27A, 0xA284, 0xA291, 0xA299, 0xA25A, 0xA2DC, 0xA2DE
     };
     for (unsigned i = 0; i < sizeof extra / sizeof extra[0]; i++)
         s_addr[n++] = extra[i];
@@ -251,7 +254,12 @@ static void set_idle(Player *p) {
     blob_set(p, 0xA217, 0x40);
     blob_set(p, 0xA221, 0);
     blob_set(p, 0xA224, 0);
+    blob_set(p, 0xA24D, 0);
+    blob_set(p, 0xA25A, 0);
+    blob_set(p, 0xA284, 0);
+    blob_set(p, 0xA291, 0);
     p->face = 1;
+    s_flutter_tick = 0;
 }
 
 /* Level cells. Rows 0..15 are cart RAM bank 0, 16..31 are WRAM bank 0,
@@ -395,25 +403,77 @@ static void step_p2(GBContext *ctx) {
     Player *p = &s_pl[1];
     if (!p->alive || p->hide || (p->x | p->y) == 0) return;
 
-    int cap = (s_held & KEY_B) ? (2 * PX + PX / 2) : (PX + PX / 2);
-    int target = 0;
-    if (s_held & KEY_RIGHT) target = cap;
-    else if (s_held & KEY_LEFT) target = -cap;
-    if (p->vx < target) p->vx += 80;
-    if (p->vx > target) p->vx -= 80;
-    if (p->vx > cap) p->vx = cap;
-    if (p->vx < -cap) p->vx = -cap;
-    if (target == 0 && p->vx > -40 && p->vx < 40) p->vx = 0;
+    int power = blob_get(p, 0xA216);
+    /* 00:14A6. Down on the ground crouches him and 00:1701 then skips
+     * the walk, so he stops where he is. */
+    int duck = p->grounded && (s_held & KEY_DOWN);
+    if (duck) {
+        p->vx = 0;
+        blob_set(p, 0xA291, 0xFF);
+    } else {
+        blob_set(p, 0xA291, 0);
+    }
 
-    if (p->grounded && (s_pressed & KEY_A)) {
+    if (!duck) {
+        int cap = (s_held & KEY_B) ? (2 * PX + PX / 2) : (PX + PX / 2);
+        int target = 0;
+        if (s_held & KEY_RIGHT) target = cap;
+        else if (s_held & KEY_LEFT) target = -cap;
+        if (p->vx < target) p->vx += 80;
+        if (p->vx > target) p->vx -= 80;
+        if (p->vx > cap) p->vx = cap;
+        if (p->vx < -cap) p->vx = -cap;
+        if (target == 0 && p->vx > -40 && p->vx < 40) p->vx = 0;
+    }
+
+    /* Power 2 is the carrot: on the ground, holding A hops again.
+     * A fresh press is still enough for every other form. */
+    int jumped = p->grounded && (s_pressed & KEY_A);
+    if (power == 2 && p->grounded && (s_held & KEY_A) && !duck) jumped = 1;
+    if (jumped) {
         p->vy = -5 * PX;
         p->grounded = 0;
         drop_platform();
+        blob_set(p, 0xA291, 0);
+        blob_set(p, 0xA284, 0);
+        s_flutter_tick = 0;
     } else if (!p->grounded && s_on_plat < 0) {
-        if (p->vy < 0 && !(s_held & KEY_A) && p->vy < -2 * PX)
-            p->vy = -2 * PX;
-        p->vy += 48;
-        if (p->vy > 4 * PX) p->vy = 4 * PX;
+        /* 00:1090. A second press in the air, once the rise has eased,
+         * starts the glide. Holding A refreshes it every 12 frames. */
+        int flutter = 0;
+        if (power == 2 && (s_pressed & KEY_A) && p->vy > -3 * PX) {
+            blob_set(p, 0xA284, 0xFF);
+            s_flutter_tick = 0;
+            p->vy = 0;
+            blob_set(p, 0xA24D, 8);
+        }
+        if (power == 2 && blob_get(p, 0xA284) && (s_held & KEY_A)) {
+            flutter = 1;
+            if (++s_flutter_tick >= 12) {
+                s_flutter_tick = 0;
+                p->vy = 0;
+                blob_set(p, 0xA24D, 8);
+            }
+        } else {
+            blob_set(p, 0xA284, 0);
+            s_flutter_tick = 0;
+        }
+        uint8_t hover = blob_get(p, 0xA24D);
+        if (hover) {
+            /* 00:14FA skips the vertical step while this counts down. */
+            blob_set(p, 0xA24D, (uint8_t)(hover - 1));
+        } else {
+            if (p->vy < 0 && !(s_held & KEY_A) && p->vy < -2 * PX)
+                p->vy = -2 * PX;
+            p->vy += 48;
+            if (p->vy > 4 * PX) p->vy = 4 * PX;
+            if (flutter && p->vy > PX) p->vy = PX;
+        }
+    } else if (p->grounded) {
+        blob_set(p, 0xA284, 0);
+        s_flutter_tick = 0;
+        uint8_t hover = blob_get(p, 0xA24D);
+        if (hover) blob_set(p, 0xA24D, (uint8_t)(hover - 1));
     }
 
     p->fx += p->vx;
@@ -495,6 +555,8 @@ static void step_p2(GBContext *ctx) {
     else if (p->vy > 0) blob_set(p, 0xA201, 0x10);
     else blob_set(p, 0xA201, 0x40);
     blob_set(p, 0xA214, p->grounded ? 0xFF : 0x00);
+    uint8_t toss = blob_get(p, 0xA25A);
+    if (toss) blob_set(p, 0xA25A, (uint8_t)(toss - 1));
 }
 
 static void save_player(GBContext *ctx, Player *p) {
@@ -955,7 +1017,7 @@ static void finish_hit(GBContext *ctx) {
             s_pl[g].vx = s_pl[g].vy = 0;
             s_pl[g].grounded = 0;
         } else {
-            blob_set(&s_pl[g], 0xA216, (uint8_t)(power == 2 ? 1 : 0));
+            blob_set(&s_pl[g], 0xA216, (uint8_t)(power == 1 ? 0 : 1));
             blob_set(&s_pl[g], 0xA224, 0);
             blob_set(&s_pl[g], 0xA217, 0x40);
         }
@@ -1046,6 +1108,32 @@ static void carry_p2(GBContext *ctx) {
     set_pos(p, p->x + dx, p->y + dy);
     p->grounded = 1;
     p->vy = 0;
+}
+
+/* 00:32C1. Power 3 is the fire flower. B drops a ball into a free slot
+ * at $A880. The ROM moves every slot once later in the frame, so this
+ * only fills an empty one and does not step a ball Mario already shot. */
+static void shoot_fireball(GBContext *ctx, Player *p) {
+    if (!p->alive || blob_get(p, 0xA216) != 3) return;
+    if (blob_get(p, 0xA291) || !(s_pressed & KEY_B)) return;
+    for (int i = 0; i < 2; i++) {
+        unsigned base = 0xA880u + (unsigned)i * 0x10u;
+        if (eram_at(ctx, base) != 0) continue;
+        int y = p->y + 28;
+        int x = p->x + 16;
+        if (y < 0) y = 0;
+        if (x < 0) x = 0;
+        eram_put(ctx, base + 0, 1);
+        eram_put(ctx, base + 1, (uint8_t)y);
+        eram_put(ctx, base + 2, (uint8_t)(y >> 8));
+        eram_put(ctx, base + 3, (uint8_t)x);
+        eram_put(ctx, base + 4, (uint8_t)(x >> 8));
+        eram_put(ctx, base + 5, p->face ? 1 : 0xFF);
+        eram_put(ctx, base + 6, 0);
+        eram_put(ctx, 0xA460, 11);
+        blob_set(p, 0xA25A, 8);
+        return;
+    }
 }
 
 /* Blocks, coins and enemies live in the ROM. Run those routines on his
@@ -1154,7 +1242,7 @@ static void interact_p2(GBContext *ctx) {
             p->grounded = 0;
             killed = 1;
         } else {
-            blob_set(p, 0xA216, (uint8_t)(power == 2 ? 1 : 0));
+            blob_set(p, 0xA216, (uint8_t)(power == 1 ? 0 : 1));
             blob_set(p, 0xA224, 0);
             blob_set(p, 0xA217, 0x40);
         }
@@ -1162,6 +1250,7 @@ static void interact_p2(GBContext *ctx) {
     } else {
         stick_platform(ctx, p);
     }
+    if (p->alive) shoot_fireball(ctx, p);
     if (killed) {
         /* 00:2D7D queues the death jingle in $A460. That replaces the
          * level song. His death is local, so the song stays. */
@@ -1424,7 +1513,10 @@ static const uint8_t *metasprite(const GBContext *ctx, int index) {
 static int mario_frame(const Player *p) {
     int right = p->face != 0;
     int base;
-    if (!p->grounded)
+    int duck = p->grounded && blob_get(p, 0xA291);
+    if (duck)
+        base = right ? 14 : 15;
+    else if (!p->grounded)
         base = p->vy < 0 ? (right ? 8 : 9) : (right ? 10 : 11);
     else if (p->vx > -40 && p->vx < 40)
         base = right ? 0 : 4;
@@ -1441,8 +1533,15 @@ static int mario_frame(const Player *p) {
     int mercy = blob_get(p, 0xA217);
     if (mercy & 4) base += 32;
     else if (power == 0) base += 32;
-    else if (power == 2) base += 69;
-    else if (power == 3) base += 112;
+    else if (power == 2) {
+        base += 69;
+        /* Bit 2 of $A24D is the carrot flutter pose (01:548A). */
+        if (blob_get(p, 0xA24D) & 4) base += 26;
+    } else if (power == 3) {
+        base += 112;
+        /* $A25A counts the fireball throw (01:548A). */
+        if (blob_get(p, 0xA25A)) base += 32;
+    }
     return base;
 }
 
