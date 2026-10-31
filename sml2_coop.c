@@ -39,6 +39,7 @@
 #define KEY_LEFT   0x20
 #define KEY_UP     0x40
 #define KEY_DOWN   0x80
+#define KEY_SELECT 0x04
 #define HUD_Y      136
 /* Speeds are 8.8 fixed point. One pixel is PX. */
 #define PX         256
@@ -59,6 +60,8 @@
 #define PC_MOVE       0x0F71u
 #define PC_CLAMP      0x0FBFu
 #define PC_HIT        0x2D7Du
+#define PC_HEAD       0x1DFEu /* ceiling probe while rising */
+#define PC_BUMP       0x1993u /* pop the block that probe just touched */
 #define PC_SHOT_A     0x324Fu
 #define PC_SHOT_B     0x331Cu
 
@@ -103,6 +106,8 @@ static int s_level = -1;
 static int s_prev_mode = -1;
 static int s_track_x = -1;
 static int s_track_y = -1;
+static int s_bonk;
+static int s_bonk_x, s_bonk_y;
 static int s_blob_n;
 static uint16_t s_addr[BLOB_MAX];
 static Regs s_regs;
@@ -253,12 +258,32 @@ static uint8_t level_byte(const GBContext *ctx, unsigned addr) {
     return 0;
 }
 
+static int tile_id(const GBContext *ctx, int x, int y) {
+    if (x < 0 || y < 0 || x >= 4096 || y >= 768) return 0xFF;
+    unsigned addr = 0xB000u + ((unsigned)(y >> 4) & 0xFFu) * 0x100u
+                            + ((unsigned)(x >> 4) & 0xFFu);
+    return level_byte(ctx, addr);
+}
+
+/* 00:1DFE. Small Mario's head is 12 px under the origin, big Mario's is 2.
+ * A hit is an id below $38, or the empty-box id $7E. Ids 0..3 and $7E are
+ * the boxes 00:1993 actually pops. */
+static int head_reach(const Player *p) {
+    return blob_get(p, 0xA216) ? 2 : 12;
+}
+
+static int ceiling_tile(int id) {
+    return id < 0x38 || id == 0x7E;
+}
+
+static int bump_tile(int id) {
+    return id < 4 || id == 0x7E;
+}
+
 static int occupied(const GBContext *ctx, int x, int y) {
     if (x < 0 || x >= 4096) return 1;
     if (y < 0 || y >= 768) return 0;
-    unsigned addr = 0xB000u + ((unsigned)(y >> 4) & 0xFFu) * 0x100u
-                            + ((unsigned)(x >> 4) & 0xFFu);
-    return level_byte(ctx, addr) < 0x48;
+    return tile_id(ctx, x, y) < 0x48;
 }
 
 /* The picture is centred on x, so the feet samples sit under the square
@@ -344,13 +369,22 @@ static void step_p2(GBContext *ctx) {
             } else {
                 p->grounded = 0;
             }
-        } else if (occupied(ctx, x - 4, ny + SQUARE_TOP) ||
-                   occupied(ctx, x + 4, ny + SQUARE_TOP)) {
-            p->fy = prev * PX;
-            p->vy = 0;
-            p->grounded = 0;
         } else {
-            p->grounded = 0;
+            int head = ny + head_reach(p);
+            int left = tile_id(ctx, x - 4, head);
+            int right = tile_id(ctx, x + 4, head);
+            if (ceiling_tile(left) || ceiling_tile(right)) {
+                p->fy = prev * PX;
+                p->vy = 0;
+                p->grounded = 0;
+                if (bump_tile(left) || bump_tile(right)) {
+                    s_bonk = 1;
+                    s_bonk_x = bump_tile(left) ? x - 4 : x + 4;
+                    s_bonk_y = ny;
+                }
+            } else {
+                p->grounded = 0;
+            }
         }
     }
 
@@ -424,6 +458,16 @@ static void bias_x(GBContext *ctx, int delta) {
     if (x < 0) x = 0;
     ctx->hram[SML2_MARIO_X - 0xFF80] = (uint8_t)x;
     ctx->hram[SML2_MARIO_X - 0xFF80 + 1] = (uint8_t)(x >> 8);
+}
+
+static void write_origin(GBContext *ctx, int x, int y) {
+    if (!ctx->hram) return;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    ctx->hram[0xFFC0 - 0xFF80] = (uint8_t)y;
+    ctx->hram[0xFFC1 - 0xFF80] = (uint8_t)(y >> 8);
+    ctx->hram[0xFFC2 - 0xFF80] = (uint8_t)x;
+    ctx->hram[0xFFC3 - 0xFF80] = (uint8_t)(x >> 8);
 }
 
 static void remember_keys(GBContext *ctx) {
@@ -666,8 +710,9 @@ static void sample_p2(uint64_t frame) {
 }
 
 static void give_p2_keys(GBContext *ctx) {
-    ctx->hram[0] = s_held;
-    ctx->hram[1] = s_pressed;
+    /* Select is his respawn, not a button the ROM should also see. */
+    ctx->hram[0] = (uint8_t)(s_held & ~KEY_SELECT);
+    ctx->hram[1] = (uint8_t)(s_pressed & ~KEY_SELECT);
 }
 
 static void run_real(GBContext *ctx, uint16_t addr) {
@@ -874,6 +919,7 @@ static void interact_p2(GBContext *ctx) {
     Player *p = &s_pl[1];
     s_hit_frames++;
     if (s_lead != 0 || !p->alive || p->hide || (p->x | p->y) == 0) {
+        s_bonk = 0;
         if (s_hit_frames <= 8 || (s_hit_frames % 120) == 0)
             coop_log("hit %d skip lead=%d alive=%d hide=%d x=%d y=%d",
                      s_hit_frames, s_lead, p->alive, p->hide, p->x, p->y);
@@ -896,6 +942,19 @@ static void interact_p2(GBContext *ctx) {
     s_lock_p2 = 1;
     give_p2_keys(ctx);
     load_player(ctx, p);
+    /* He rose into a box. 00:1DFE samples the head, then 00:1993 pops it.
+     * The probe has to see the penetrating position; the pop then uses
+     * the position he actually stopped at. */
+    if (s_bonk) {
+        int into_x = s_bonk_x;
+        int into_y = s_bonk_y;
+        s_bonk = 0;
+        write_origin(ctx, into_x - 8, into_y);
+        pump_call(ctx, PC_HEAD);
+        uint8_t id = eram_at(ctx, 0xA20D);
+        memcpy(ctx->hram + (0xFFC0 - 0xFF80), p->pos, 4);
+        if (id < 4 || id == 0x7E) pump_call(ctx, PC_BUMP);
+    }
     write_screen(ctx);
     bias_x(ctx, -8);
     pump_call(ctx, PC_BLOCKS);
@@ -1115,6 +1174,10 @@ static void coop_snapshot(GBContext *ctx) {
         s_in_pipe = 0;
         beside_mario(ctx);
     }
+    if (mode == MODE_PLAY && (s_pressed & KEY_SELECT)) {
+        s_bonk = 0;
+        beside_mario(ctx);
+    }
     if (mode != MODE_PLAY || s_in_pipe) return;
     Player *g = &s_pl[ghost_index()];
     if (!entered) {
@@ -1133,8 +1196,8 @@ static uint8_t coop_read(GBContext *ctx, uint16_t addr, uint8_t value) {
     /* Whoever is in the registers sees only his own buttons. Mario's
      * latched pad must not also walk the green player, or the reverse. */
     if (s_lock_p2 || (s_lead == 1 && s_phase == PHASE_IDLE)) {
-        if (addr == 0xFF80) value = s_held;
-        else if (addr == 0xFF81) value = s_pressed;
+        if (addr == 0xFF80) value = (uint8_t)(s_held & ~KEY_SELECT);
+        else if (addr == 0xFF81) value = (uint8_t)(s_pressed & ~KEY_SELECT);
     }
     return value;
 }
@@ -1309,6 +1372,7 @@ static void coop_reset(GBContext *ctx) {
     s_prev_mode = -1;
     s_track_x = -1;
     s_track_y = -1;
+    s_bonk = 0;
     s_held = s_pressed = s_prev_held = 0;
     s_lock_p2 = 0;
     s_polled_frame = ~0ull;
