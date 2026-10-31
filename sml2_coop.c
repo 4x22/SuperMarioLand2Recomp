@@ -64,6 +64,12 @@
 #define PC_BUMP       0x1993u /* pop the block that probe just touched */
 #define PC_SHOT_A     0x324Fu
 #define PC_SHOT_B     0x331Cu
+/* 00:0652 calls the actor loop and returns here. Platforms move in that
+ * loop, after 00:0626, and add their step to Mario when his ride bit is set. */
+#define PC_AFTER_ACTORS 0x0664u
+#define ACTOR_BASE    0xAD00u
+#define ACTOR_SLOTS   16
+#define ACTOR_STRIDE  0x20u
 
 #define PHASE_IDLE 0
 #define PHASE_MOVE 1
@@ -108,6 +114,12 @@ static int s_track_x = -1;
 static int s_track_y = -1;
 static int s_bonk;
 static int s_bonk_x, s_bonk_y;
+/* Actor slot whose step is added to player 2 after the actor loop.
+ * -1 means he is not standing on a moving platform. */
+static int s_on_plat = -1;
+static int s_plat_ready;
+static int s_plat_bank;
+static int s_plat_x, s_plat_y;
 static int s_blob_n;
 static uint16_t s_addr[BLOB_MAX];
 static Regs s_regs;
@@ -293,6 +305,72 @@ static int on_floor(const GBContext *ctx, int x, int y) {
     return occupied(ctx, x - 4, feet) || occupied(ctx, x + 4, feet);
 }
 
+/* Actor bytes live in cart RAM. The actor loop may leave a different
+ * SRAM bank mapped than the one that was current when we sampled it. */
+static uint8_t eram_bank(const GBContext *ctx, int bank, unsigned addr) {
+    if (!ctx || !ctx->eram || addr < 0xA000u || addr >= 0xC000u) return 0;
+    unsigned off = (unsigned)bank * 0x2000u + (addr - 0xA000u);
+    return off < ctx->eram_size ? ctx->eram[off] : 0;
+}
+
+static unsigned actor_addr(int slot, int off) {
+    return ACTOR_BASE + (unsigned)slot * ACTOR_STRIDE + (unsigned)off;
+}
+
+static void drop_platform(void) {
+    s_on_plat = -1;
+    s_plat_ready = 0;
+}
+
+/* 00:2EDD, in the units that routine actually uses. Screen position is
+ * the low byte only: world_lo - camera_lo + 96/98 (01:54A7). A platform
+ * is an actor whose flag byte has bit 5, and the stand window is the
+ * top 12 px of its box (00:2DC6 rejects a depth of $0C or more). */
+static int platform_under(const GBContext *ctx, int x, int y, int *depth_out) {
+    uint8_t sx = (uint8_t)((x & 0xFF) - (hram16(ctx, SML2_CAM_X) & 0xFF) + 96);
+    uint8_t sy = (uint8_t)((y & 0xFF) - (hram16(ctx, SML2_CAM_Y) & 0xFF) + 98);
+    int small = blob_get(&s_pl[1], 0xA216) == 0;
+    int duck = blob_get(&s_pl[1], 0xA291) != 0;
+    uint8_t eadj = (uint8_t)(small ? (duck ? 248 : 0) : (duck ? 0 : 8));
+    int best = -1;
+    int best_d = 0x0C;
+    for (int i = 0; i < ACTOR_SLOTS; i++) {
+        unsigned base = actor_addr(i, 0);
+        uint8_t flags = eram_at(ctx, base + 18);
+        if ((flags & 0x20) == 0) continue;
+        /* Status bit 3 means someone is already riding. Any other bit
+         * takes the actor out of the overlap test (00:2EDD ands with $F7). */
+        if (eram_at(ctx, base + 23) & 0xF7) continue;
+        uint8_t ay = eram_at(ctx, base + 9);
+        uint8_t ax = eram_at(ctx, base + 10);
+        uint8_t top = eram_at(ctx, base + 19);
+        uint8_t bot = eram_at(ctx, base + 20);
+        uint8_t left = eram_at(ctx, base + 21);
+        uint8_t right = eram_at(ctx, base + 22);
+        uint8_t d0 = (uint8_t)(top + ay - 20);
+        uint8_t span = (uint8_t)(bot + ay + eadj - d0);
+        uint8_t depth = (uint8_t)(sy - d0);
+        if (depth >= span || depth >= 0x0C) continue;
+        uint8_t x0 = (uint8_t)(left + ax + 11 - 16);
+        uint8_t spanx = (uint8_t)(right + ax + 20 - 16 - x0);
+        if ((uint8_t)(sx - x0) >= spanx) continue;
+        if (depth < best_d) {
+            best_d = depth;
+            best = i;
+        }
+    }
+    if (depth_out) *depth_out = best_d;
+    return best;
+}
+
+/* World position the actor loop adds its step to. High byte first:
+ * 02:5B4C1 copies Mario's Y low into actor+4 and Y high into actor+3. */
+static int actor_axis(const GBContext *ctx, int bank, int slot, int hi, int lo) {
+    unsigned base = actor_addr(slot, 0);
+    return (eram_bank(ctx, bank, base + (unsigned)hi) << 8)
+         | eram_bank(ctx, bank, base + (unsigned)lo);
+}
+
 static void publish_pos(Player *p) {
     int x = p->fx >> 8;
     int y = p->fy >> 8;
@@ -330,7 +408,8 @@ static void step_p2(GBContext *ctx) {
     if (p->grounded && (s_pressed & KEY_A)) {
         p->vy = -5 * PX;
         p->grounded = 0;
-    } else if (!p->grounded) {
+        drop_platform();
+    } else if (!p->grounded && s_on_plat < 0) {
         if (p->vy < 0 && !(s_held & KEY_A) && p->vy < -2 * PX)
             p->vy = -2 * PX;
         p->vy += 48;
@@ -355,7 +434,13 @@ static void step_p2(GBContext *ctx) {
         int prev = p->y;
         p->fy += p->vy;
         int ny = p->fy >> 8;
-        if (p->vy >= 0) {
+        if (s_on_plat >= 0) {
+            /* The platform is an actor, not a tile. Hold him until the
+             * actor loop's step is applied later this frame. */
+            p->fy = p->y * PX;
+            p->vy = 0;
+            p->grounded = 1;
+        } else if (p->vy >= 0) {
             if (on_floor(ctx, x, ny)) {
                 int guard = 0;
                 while (ny > 0 && on_floor(ctx, x, ny) && guard++ < 32) ny--;
@@ -398,6 +483,7 @@ static void step_p2(GBContext *ctx) {
         p->respawn = RESPAWN_FRAMES;
         p->vx = p->vy = 0;
         p->grounded = 0;
+        drop_platform();
         return;
     }
 
@@ -913,6 +999,55 @@ static void maybe_start_move(GBContext *ctx) {
     run_real(ctx, PC_AFTER_MOVE);
 }
 
+/* Land him on a moving platform and remember that actor's position.
+ * The actor loop has not run yet; its step is applied in carry_p2. */
+static void stick_platform(GBContext *ctx, Player *p) {
+    if (p->vy < 0) {
+        drop_platform();
+        return;
+    }
+    int depth = 0;
+    int slot = platform_under(ctx, p->x, p->y, &depth);
+    if (slot < 0) {
+        drop_platform();
+        return;
+    }
+    s_on_plat = slot;
+    /* Sit him on the top of the stand window. 00:2DC6 only creeps up one
+     * pixel a frame; the host would fall through the box before that finished. */
+    if (depth > 2 && p->y > depth - 2) set_pos(p, p->x, p->y - (depth - 2));
+    p->vy = 0;
+    p->fy = p->y * PX;
+    p->grounded = 1;
+    blob_set(p, 0xA201, 0x18);
+    blob_set(p, 0xA214, 0xFF);
+    unsigned base = actor_addr(slot, 0);
+    s_plat_bank = ctx->ram_bank;
+    s_plat_x = (eram_at(ctx, base + 0) << 8) | eram_at(ctx, base + 1);
+    s_plat_y = (eram_at(ctx, base + 3) << 8) | eram_at(ctx, base + 4);
+    s_plat_ready = 1;
+}
+
+/* 00:3CDF / 00:3D10 add the actor's step to Mario when status bit 3 is
+ * set. Player 2 is not in those registers, so the same step is added here
+ * once the actor loop has stored the actor's new position. */
+static void carry_p2(GBContext *ctx) {
+    if (!s_plat_ready || s_on_plat < 0) return;
+    s_plat_ready = 0;
+    if (!ctx || mode_of(ctx) != MODE_PLAY) return;
+    Player *p = &s_pl[1];
+    if (!p->alive || p->hide || s_lead != 0) return;
+    int nx = actor_axis(ctx, s_plat_bank, s_on_plat, 0, 1);
+    int ny = actor_axis(ctx, s_plat_bank, s_on_plat, 3, 4);
+    int dx = nx - s_plat_x;
+    int dy = ny - s_plat_y;
+    if (dx < -16 || dx > 16 || dy < -16 || dy > 16) return;
+    if (dx == 0 && dy == 0) return;
+    set_pos(p, p->x + dx, p->y + dy);
+    p->grounded = 1;
+    p->vy = 0;
+}
+
 /* Blocks, coins and enemies live in the ROM. Run those routines on his
  * position, then put his own walk back so they cannot drag him. */
 static void interact_p2(GBContext *ctx) {
@@ -920,6 +1055,7 @@ static void interact_p2(GBContext *ctx) {
     s_hit_frames++;
     if (s_lead != 0 || !p->alive || p->hide || (p->x | p->y) == 0) {
         s_bonk = 0;
+        drop_platform();
         if (s_hit_frames <= 8 || (s_hit_frames % 120) == 0)
             coop_log("hit %d skip lead=%d alive=%d hide=%d x=%d y=%d",
                      s_hit_frames, s_lead, p->alive, p->hide, p->x, p->y);
@@ -964,9 +1100,26 @@ static void interact_p2(GBContext *ctx) {
     int body_steps = s_pump_steps;
     uint16_t body_pc = s_pump_pc;
     memcpy(ctx->hram + (0xFFC0 - 0xFF80), p->pos, 4);
+    /* 00:2D7D clears $A26B on entry and sets status bit 4 on whatever
+     * it overlaps. $A26B is what keeps Mario from falling through a lift
+     * on the next frame (00:129F), and status bit 3 is what makes the
+     * actor loop carry him (00:3CDF). Neither lives in his saved blob,
+     * so put both back after the pump. Enemy status bytes stay changed. */
+    uint8_t ride_flag = eram_at(ctx, 0xA26B);
+    uint8_t plat_status[ACTOR_SLOTS];
+    uint8_t plat_slot[ACTOR_SLOTS];
+    for (int i = 0; i < ACTOR_SLOTS; i++) {
+        unsigned base = actor_addr(i, 0);
+        plat_slot[i] = (uint8_t)((eram_at(ctx, base + 18) & 0x20) != 0);
+        plat_status[i] = plat_slot[i] ? eram_at(ctx, base + 23) : 0;
+    }
     pump_call(ctx, PC_HIT);
     int hit_steps = s_pump_steps;
     uint16_t hit_pc = s_pump_pc;
+    eram_put(ctx, 0xA26B, ride_flag);
+    for (int i = 0; i < ACTOR_SLOTS; i++) {
+        if (plat_slot[i]) eram_put(ctx, actor_addr(i, 23), plat_status[i]);
+    }
 
     int stomped = eram_at(ctx, 0xA2D4) != 0;
     uint8_t hurt = eram_at(ctx, 0xA224);
@@ -990,6 +1143,7 @@ static void interact_p2(GBContext *ctx) {
         p->grounded = 0;
         blob_set(p, 0xA201, 0x10);
         blob_set(p, 0xA214, 0);
+        drop_platform();
     } else if (hurt == 0x0F || hurt == 0xFF || hurt == 0x80) {
         uint8_t power = blob_get(p, 0xA216);
         if (power == 0 || hurt == 0xFF || hurt == 0x80) {
@@ -1004,6 +1158,9 @@ static void interact_p2(GBContext *ctx) {
             blob_set(p, 0xA224, 0);
             blob_set(p, 0xA217, 0x40);
         }
+        drop_platform();
+    } else {
+        stick_platform(ctx, p);
     }
     if (killed) {
         /* 00:2D7D queues the death jingle in $A460. That replaces the
@@ -1019,11 +1176,11 @@ static void interact_p2(GBContext *ctx) {
         || blocks_steps >= 20000 || body_steps >= 20000 || hit_steps >= 20000;
     if (s_hit_frames <= 40 || interesting || (s_hit_frames % 60) == 0)
         coop_log("hit %d x=%d y=%d feet=%02X above=%02X coins %02X->%02X "
-                 "blocks %d/%04X body %d/%04X enemies %d/%04X stomp=%d hurt=%02X",
-                 s_hit_frames, keep_x, keep_y, feet & 0xFF, above & 0xFF,
+                 "blocks %d/%04X body %d/%04X enemies %d/%04X stomp=%d hurt=%02X plat=%d",
+                 s_hit_frames, p->x, p->y, feet & 0xFF, above & 0xFF,
                  coins_before, coins,
                  blocks_steps, blocks_pc, body_steps, body_pc,
-                 hit_steps, hit_pc, stomped, hurt);
+                 hit_steps, hit_pc, stomped, hurt, s_on_plat);
     load_player(ctx, &s_pl[s_lead]);
     load_regs(ctx);
     restore_keys(ctx);
@@ -1039,8 +1196,16 @@ static void maybe_start_hit(GBContext *ctx) {
  * first address of each wake, so the block and enemy routines have to
  * start here. Return 0 so the real instruction still runs. */
 int game_dispatch_override(struct GBContext *ctx, uint16_t addr) {
-    if (!s_on || s_pumping || !ctx || addr != PC_AFTER_HIT) return 0;
-    if (mode_of(ctx) != MODE_PLAY || s_in_pipe) return 0;
+    if (!s_on || s_pumping || !ctx) return 0;
+    if (addr == PC_AFTER_ACTORS) {
+        carry_p2(ctx);
+        return 0;
+    }
+    if (addr != PC_AFTER_HIT) return 0;
+    if (mode_of(ctx) != MODE_PLAY || s_in_pipe) {
+        drop_platform();
+        return 0;
+    }
     interact_p2(ctx);
     return 0;
 }
@@ -1139,6 +1304,7 @@ static void beside_mario(GBContext *ctx) {
     if ((x | y) == 0 || s_lead != 0) return;
     set_pos(&s_pl[1], x + 18, y);
     set_idle(&s_pl[1]);
+    drop_platform();
     s_pl[1].alive = 1;
     s_pl[1].hide = 0;
     s_pl[1].respawn = 0;
@@ -1373,6 +1539,7 @@ static void coop_reset(GBContext *ctx) {
     s_track_x = -1;
     s_track_y = -1;
     s_bonk = 0;
+    drop_platform();
     s_held = s_pressed = s_prev_held = 0;
     s_lock_p2 = 0;
     s_polled_frame = ~0ull;
