@@ -20,6 +20,7 @@
 #include "game_extras.h"
 #include "gb_body.h"
 #include "sml2_adaptive.h"
+#include "sml2_coop.h"
 #include "sml2_mods.h"
 
 #ifndef SML2_HAVE_DX_BODY
@@ -102,7 +103,11 @@ const uint32_t *game_get_valid_crcs(int *out_count) {
 
 /* The adaptive widescreen compositor installs itself here, and does nothing at
  * all unless the launcher's Mods page has it enabled. */
-void game_on_init(struct GBContext *ctx) { sml2_adaptive_init(ctx); }
+void game_on_init(struct GBContext *ctx) {
+    sml2_adaptive_init(ctx);
+    /* After the widescreen hooks, so co-op can wrap whatever they installed. */
+    sml2_coop_init(ctx);
+}
 
 const struct RecompLauncherCModProvider *game_get_mods(const char *exe_dir) {
     return sml2_mod_provider(exe_dir);

@@ -8,6 +8,7 @@ typedef struct {
     int width;        /* -1 = fit window, else fixed game-pixel width */
     int dx;           /* DX colour body selected (0 = faithful V1.0 body) */
     int spawns;       /* SML2_SPAWNS_ORIGINAL / SML2_SPAWNS_EXTENDED */
+    int coop;         /* second Mario on controller 2 / IJKL (0 = off) */
 } SML2ModSettings;
 
 /* Where the game's enemy spawn scanner is allowed to look. Original leaves the

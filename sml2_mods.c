@@ -27,8 +27,9 @@
 #define ENV_WIDESCREEN "SML2_WIDESCREEN"
 #define ENV_DX "SML2_DX"
 #define ENV_SPAWNS "SML2_SPAWNS"
+#define ENV_COOP "SML2_COOP"
 
-enum { PKG_WIDESCREEN = 0, PKG_DX, PKG_COUNT };
+enum { PKG_WIDESCREEN = 0, PKG_DX, PKG_COOP, PKG_COUNT };
 
 typedef struct {
     const char *package_id;
@@ -63,6 +64,17 @@ static const Sml2Package packages[PKG_COUNT] = {
         "keeps its own save.",
         0,
     },
+    [PKG_COOP] = {
+        "sml2-simultaneous-coop", "simultaneous-coop", "Simultaneous co-op",
+        "Gameplay",
+        "A second Mario for local play. Assign him on the Player 2 card.",
+        "Player 1 and Player 2 each have a card under Controllers: keyboard or "
+        "a gamepad. Player 2's default keys are I/K up and down, J/L left and "
+        "right, U jump, O run. He is the green Mario. He uses pipes, coins, "
+        "blocks and enemies. The camera follows whoever is still alive. Off, "
+        "the game is single player.",
+        0,
+    },
 };
 
 static const char *const aspects[] = { "Fit", "16:9", "21:9", "32:9" };
@@ -83,7 +95,7 @@ static int valid_width(int width) { return width == -1 || (width >= 160 && width
 static void load(const char *base) {
     if (loaded) return;
     loaded = 1;
-    settings = (SML2ModSettings){ 0, -1, 0, SML2_SPAWNS_EXTENDED };
+    settings = (SML2ModSettings){ 0, -1, 0, SML2_SPAWNS_EXTENDED, 0 };
     snprintf(base_dir, sizeof(base_dir), "%s%s", base ? base : "",
              base && base[0] && base[strlen(base) - 1] != '/' && base[strlen(base) - 1] != '\\'
                  ? "/" : "");
@@ -100,6 +112,8 @@ static void load(const char *base) {
             if (!strcmp(key, "DX") && (value == 0 || value == 1)) settings.dx = value;
             if (!strcmp(key, "Spawns") && value >= 0 && value < SPAWN_COUNT)
                 settings.spawns = value;
+            if (!strcmp(key, "Coop") && (value == 0 || value == 1))
+                settings.coop = value;
         }
         fclose(f);
     }
@@ -124,6 +138,8 @@ static void load(const char *base) {
     }
     const char *dx = getenv(ENV_DX);
     if (dx && dx[0]) settings.dx = atoi(dx) != 0;
+    const char *coop = getenv(ENV_COOP);
+    if (coop && coop[0]) settings.coop = atoi(coop) != 0;
     /* Accepts the choice label either way round -- SML2_SPAWNS=original and
      * SML2_SPAWNS=Original both select it. */
     const char *spawns = getenv(ENV_SPAWNS);
@@ -176,6 +192,7 @@ static int package_enabled(int i) {
     switch (i) {
         case PKG_WIDESCREEN: return settings.widescreen;
         case PKG_DX:         return settings.dx;
+        case PKG_COOP:       return settings.coop;
         default: return 0;
     }
 }
@@ -184,6 +201,7 @@ static void package_set_enabled(int i, int enabled) {
     switch (i) {
         case PKG_WIDESCREEN: settings.widescreen = enabled != 0; break;
         case PKG_DX:         settings.dx = enabled != 0; break;
+        case PKG_COOP:       settings.coop = enabled != 0; break;
         default: break;
     }
 }
@@ -246,6 +264,13 @@ static int feature_get(void *ctx, int index, RecompLauncherCModFeature *out) {
         } else {
             COPY(out->status, "Off: the game runs faithfully, as the original monochrome "
                               "Game Boy release.");
+        }
+    } else if (index == PKG_COOP) {
+        if (package_enabled(index)) {
+            COPY(out->status, "On: Player 2 is the second card under Controllers. "
+                              "Default keys I/K J/L, U jump, O run. Green Mario.");
+        } else {
+            COPY(out->status, "Off: single player.");
         }
     } else {
         COPY(out->status, package_enabled(index) ? "Enabled" : "Disabled");
@@ -395,9 +420,9 @@ static int commit(void *ctx, const char *image) {
     char temporary[1050];
     snprintf(temporary, sizeof(temporary), "%s.tmp", config_path);
     FILE *f = fopen(temporary, "w");
-    int ok = f && fprintf(f, "[Mods]\nAdaptiveWidescreen=%d\nWidth=%d\nDX=%d\nSpawns=%d\n",
+    int ok = f && fprintf(f, "[Mods]\nAdaptiveWidescreen=%d\nWidth=%d\nDX=%d\nSpawns=%d\nCoop=%d\n",
                           settings.widescreen, settings.width, settings.dx,
-                          settings.spawns) > 0;
+                          settings.spawns, settings.coop) > 0;
     if (f && fclose(f) != 0) ok = 0;
     if (ok) {
 #ifdef _WIN32
