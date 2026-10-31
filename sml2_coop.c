@@ -47,6 +47,7 @@
  * and its bottom on that sample. */
 #define SQUARE_H   16
 #define SQUARE_TOP 12
+#define DRAW_DROP  5
 #define PC_BLOCKS  0x1413u
 #define PC_BODY    0x1BFFu
 
@@ -83,6 +84,8 @@ typedef struct {
     int alive;
     int hide;
     int respawn;
+    int face; /* 1 right, 0 left. His own, not Mario's. */
+    int anim;
 } Player;
 
 static Player s_pl[2];
@@ -230,6 +233,7 @@ static void set_idle(Player *p) {
     blob_set(p, 0xA217, 0x40);
     blob_set(p, 0xA221, 0);
     blob_set(p, 0xA224, 0);
+    p->face = 1;
 }
 
 /* Level cells. Rows 0..15 are cart RAM bank 0, 16..31 are WRAM bank 0,
@@ -350,6 +354,9 @@ static void step_p2(GBContext *ctx) {
     }
 
     publish_pos(p);
+    if (s_held & KEY_LEFT) p->face = 0;
+    else if (s_held & KEY_RIGHT) p->face = 1;
+    if (p->grounded && p->vx) p->anim++;
     if (p->y > 740) {
         p->alive = 0;
         p->hide = 0;
@@ -857,6 +864,11 @@ static void interact_p2(GBContext *ctx) {
     int keep_vx = p->vx, keep_vy = p->vy;
     int keep_ground = p->grounded;
     uint8_t coins_before = eram_at(ctx, 0xA262);
+    uint8_t snd460 = eram_at(ctx, 0xA460);
+    uint8_t snd468 = eram_at(ctx, 0xA468);
+    uint8_t snd470 = eram_at(ctx, 0xA470);
+    uint8_t snd478 = eram_at(ctx, 0xA478);
+    int mode_before = mode_of(ctx);
 
     save_regs(ctx);
     remember_keys(ctx);
@@ -893,6 +905,7 @@ static void interact_p2(GBContext *ctx) {
     p->vx = keep_vx;
     p->vy = keep_vy;
     p->grounded = keep_ground;
+    int killed = 0;
     if (stomped) {
         p->vy = (s_held & KEY_A) ? -5 * PX : -3 * PX;
         p->grounded = 0;
@@ -906,11 +919,21 @@ static void interact_p2(GBContext *ctx) {
             p->respawn = RESPAWN_FRAMES;
             p->vx = p->vy = 0;
             p->grounded = 0;
+            killed = 1;
         } else {
             blob_set(p, 0xA216, (uint8_t)(power == 2 ? 1 : 0));
             blob_set(p, 0xA224, 0);
             blob_set(p, 0xA217, 0x40);
         }
+    }
+    if (killed) {
+        /* 00:2D7D queues the death jingle in $A460. That replaces the
+         * level song. His death is local, so the song stays. */
+        eram_put(ctx, 0xA460, snd460);
+        eram_put(ctx, 0xA468, snd468);
+        eram_put(ctx, 0xA470, snd470);
+        eram_put(ctx, 0xA478, snd478);
+        if (mode_of(ctx) == MODE_DEAD) mode_set(ctx, mode_before);
     }
     int interesting = stomped || hurt || coins != coins_before
         || blocks_pc != 0x0001 || body_pc != 0x0001 || hit_pc != 0x0001
@@ -1102,6 +1125,96 @@ static void plot(uint32_t *out, int width, int x, int y, uint32_t color) {
     out[(size_t)y * width + x] = color;
 }
 
+static uint32_t green_shade(const GBContext *ctx, int pal, int color, uint8_t attr) {
+    int y;
+    if (ctx->config.model == GB_MODEL_CGB && ctx->ppu) {
+        const GBPPU *ppu = (const GBPPU *)ctx->ppu;
+        unsigned i = (unsigned)(pal * 8 + color * 2);
+        uint16_t c = (uint16_t)(ppu->obj_palette_ram[i] |
+                                (ppu->obj_palette_ram[i + 1] << 8));
+        int r = (c & 31) * 255 / 31;
+        int g = ((c >> 5) & 31) * 255 / 31;
+        int b = ((c >> 10) & 31) * 255 / 31;
+        y = (r * 30 + g * 59 + b * 11) / 100;
+    } else {
+        uint8_t obp = 0xE4;
+        if (ctx->ppu) {
+            const GBPPU *ppu = (const GBPPU *)ctx->ppu;
+            obp = (attr & 0x10) ? ppu->obp1 : ppu->obp0;
+        }
+        static const int lum[4] = { 255, 170, 85, 0 };
+        y = lum[(obp >> (color * 2)) & 3];
+    }
+    if (y < 0) y = 0;
+    if (y > 255) y = 255;
+    return 0xFF000000u | ((unsigned)(y / 4) << 16) | ((unsigned)y << 8) | (unsigned)(y / 5);
+}
+
+static const uint8_t *metasprite(const GBContext *ctx, int index) {
+    if (!ctx->rom || index < 0 || index > 255) return NULL;
+    /* The faithful cart keeps the table in bank 1. DX moves it to bank
+     * $2C or $2D (picked from $FFF6) and, on some levels, to $6000. */
+    int bank = 1;
+    unsigned table = 0x4000u;
+    if (ctx->rom_size > 0x80000u) {
+        uint8_t page = ctx->hram ? ctx->hram[0xFFF6u - 0xFF80u] : 0;
+        bank = (page & 0x0F) == 1 ? 0x2D : 0x2C;
+        if (eram_at(ctx, 0xA21A) & 0xF0) table = 0x6000u;
+    }
+    size_t off = (size_t)bank * 0x4000u + (table - 0x4000u) + (unsigned)index * 2u;
+    if (off + 1 >= ctx->rom_size) return NULL;
+    unsigned ptr = ctx->rom[off] | ((unsigned)ctx->rom[off + 1] << 8);
+    if (ptr < 0x4000u || ptr >= 0x8000u) return NULL;
+    size_t poff = (size_t)bank * 0x4000u + (ptr - 0x4000u);
+    if (poff >= ctx->rom_size) return NULL;
+    return ctx->rom + poff;
+}
+
+/* Same sheet Mario uses. The frame comes from his own speed and facing,
+ * so player 1's pose does not drive it. */
+static int mario_frame(const Player *p) {
+    int right = p->face != 0;
+    int base;
+    if (!p->grounded)
+        base = p->vy < 0 ? (right ? 8 : 9) : (right ? 10 : 11);
+    else if (p->vx > -40 && p->vx < 40)
+        base = right ? 0 : 4;
+    else if ((right && p->vx < 0) || (!right && p->vx > 0))
+        base = right ? 13 : 12;
+    else {
+        int step = (p->anim >> 2) & 3;
+        base = right ? 1 + step : 5 + step;
+    }
+    int power = blob_get(p, 0xA216);
+    int mercy = blob_get(p, 0xA217);
+    if (mercy & 4) base += 32;
+    else if (power == 0) base += 32;
+    else if (power == 2) base += 69;
+    else if (power == 3) base += 112;
+    return base;
+}
+
+static void blit_tile(uint32_t *out, int width, const GBContext *ctx,
+                      int dx, int dy, uint8_t tile, uint8_t attr) {
+    if (!ctx->vram) return;
+    unsigned bank = ((attr & 0x08) && ctx->config.model == GB_MODEL_CGB) ? 1u : 0u;
+    const uint8_t *src = ctx->vram + bank * 0x2000u + (unsigned)tile * 16u;
+    int flip_x = (attr & 0x20) != 0;
+    int flip_y = (attr & 0x40) != 0;
+    int pal = attr & 7;
+    for (int row = 0; row < 8; row++) {
+        int sy = flip_y ? 7 - row : row;
+        uint8_t lo = src[sy * 2];
+        uint8_t hi = src[sy * 2 + 1];
+        for (int col = 0; col < 8; col++) {
+            int bit = flip_x ? col : 7 - col;
+            int color = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+            if (!color) continue;
+            plot(out, width, dx + col, dy + row, green_shade(ctx, pal, color, attr));
+        }
+    }
+}
+
 static void draw_other(GBContext *ctx, uint32_t *out, int width) {
     const Player *g = &s_pl[1];
     /* While he occupies Mario's registers the ROM is already drawing him. */
@@ -1109,11 +1222,36 @@ static void draw_other(GBContext *ctx, uint32_t *out, int width) {
     int cam_x = hram16(ctx, SML2_CAM_X);
     int cam_y = hram16(ctx, SML2_CAM_Y);
     int origin = (width - GB_SCREEN_WIDTH) / 2;
-    int left = origin + (g->x - cam_x + SML2_CAM_CENTRE_X) - 8;
-    int top = (g->y + SQUARE_TOP - cam_y + SML2_CAM_CENTRE_Y);
-    for (int row = 0; row < 16; row++)
-        for (int col = 0; col < 16; col++)
-            plot(out, width, left + col, top + row, 0xFF20E020u);
+    int centre = origin + (g->x - cam_x + SML2_CAM_CENTRE_X);
+    int feet = (g->y + SQUARE_TOP + SQUARE_H + DRAW_DROP - cam_y + SML2_CAM_CENTRE_Y);
+    const uint8_t *ms = metasprite(ctx, mario_frame(g));
+    if (!ms) {
+        int left = centre - 8;
+        int top = feet - SQUARE_H;
+        for (int row = 0; row < 16; row++)
+            for (int col = 0; col < 16; col++)
+                plot(out, width, left + col, top + row, 0xFF20E020u);
+        return;
+    }
+    int minx = 127, miny = 127, maxx = -128, maxy = -128, n = 0;
+    int xoff[16], yoff[16];
+    uint8_t tile[16], attr[16];
+    for (; n < 16; n++) {
+        if (ms[n * 4] == 0x80) break;
+        yoff[n] = (int)(int8_t)ms[n * 4];
+        xoff[n] = (int)(int8_t)ms[n * 4 + 1];
+        tile[n] = ms[n * 4 + 2];
+        attr[n] = ms[n * 4 + 3];
+        if (xoff[n] < minx) minx = xoff[n];
+        if (yoff[n] < miny) miny = yoff[n];
+        if (xoff[n] + 8 > maxx) maxx = xoff[n] + 8;
+        if (yoff[n] + 8 > maxy) maxy = yoff[n] + 8;
+    }
+    if (n == 0) return;
+    int left = centre - (maxx - minx) / 2 - minx;
+    int top = feet - (maxy - miny) - miny;
+    for (int i = 0; i < n; i++)
+        blit_tile(out, width, ctx, left + xoff[i], top + yoff[i], tile[i], attr[i]);
 }
 
 static void fill_native(uint32_t *out, int width, const uint32_t *native) {
