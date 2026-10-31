@@ -468,6 +468,9 @@ static void load_p2_input(void) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
+    char p1_guid[40];
+    int p1_src = 1, p1_slot = 0;
+    p1_guid[0] = '\0';
     while (fgets(line, sizeof line, f)) {
         char *s = line;
         while (*s == ' ' || *s == '\t') s++;
@@ -498,6 +501,20 @@ static void load_p2_input(void) {
             if (v >= 0 && v < 8) s_p2_slot = v;
             continue;
         }
+        if (strcmp(key, "input.p1.src") == 0) {
+            int v = atoi(val);
+            if (v >= 0 && v <= 2) p1_src = v;
+            continue;
+        }
+        if (strcmp(key, "input.p1.guid") == 0) {
+            snprintf(p1_guid, sizeof p1_guid, "%s", val);
+            continue;
+        }
+        if (strcmp(key, "input.p1.slot") == 0) {
+            int v = atoi(val);
+            if (v >= 0 && v < 8) p1_slot = v;
+            continue;
+        }
         if (strncmp(key, "input.p2.", 9) != 0) continue;
         const char *rest = key + 9;
         for (int b = 0; b < P2N; b++) {
@@ -514,6 +531,19 @@ static void load_p2_input(void) {
         }
     }
     fclose(f);
+    /* The launcher stored both players on the first of two identical pads.
+     * Player 2 takes the next one, so his jump is not Mario's button. */
+    if (s_p2_src == 2 && p1_src == 2 && p1_guid[0] && s_p2_guid[0] &&
+        p1_slot == s_p2_slot) {
+        int same = 1;
+        for (int i = 0; p1_guid[i] && s_p2_guid[i]; i++) {
+            char a = p1_guid[i], b = s_p2_guid[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) { same = 0; break; }
+        }
+        if (same && s_p2_slot < 7) s_p2_slot++;
+    }
 }
 
 static int pad_guid_matches(int index) {
@@ -532,8 +562,6 @@ static int pad_guid_matches(int index) {
 }
 
 static SDL_Joystick *s_joy2;
-static SDL_Joystick *s_scan[8];
-static int s_scan_n;
 
 static void open_pad2(void) {
     if (s_p2_src != 2 || s_pad2 || s_joy2) return;
@@ -586,27 +614,6 @@ static uint8_t poll_p2(void) {
                 if ((s_p2_key[b][0] > 0 && keys[s_p2_key[b][0]]) ||
                     (s_p2_key[b][1] > 0 && keys[s_p2_key[b][1]]))
                     held |= s_p2_bit[b];
-            }
-        }
-    }
-    if (s_p2_src == 2) {
-        if (s_scan_n == 0 && SDL_NumJoysticks() > 0) {
-            int n = SDL_NumJoysticks();
-            for (int i = 0; i < n && s_scan_n < 8; i++) {
-                SDL_Joystick *joy = SDL_JoystickOpen(i);
-                if (joy) s_scan[s_scan_n++] = joy;
-            }
-        }
-        for (int i = 0; i < s_scan_n; i++) {
-            SDL_Joystick *joy = s_scan[i];
-            if (!joy || !SDL_JoystickGetAttached(joy)) continue;
-            held_from_axes(&held, SDL_JoystickGetAxis(joy, 0), SDL_JoystickGetAxis(joy, 1));
-            if (SDL_JoystickNumHats(joy) > 0) {
-                Uint8 hat = SDL_JoystickGetHat(joy, 0);
-                if (hat & SDL_HAT_RIGHT) held |= KEY_RIGHT;
-                if (hat & SDL_HAT_LEFT) held |= KEY_LEFT;
-                if (hat & SDL_HAT_UP) held |= KEY_UP;
-                if (hat & SDL_HAT_DOWN) held |= KEY_DOWN;
             }
         }
     }
@@ -1195,7 +1202,10 @@ static int mario_frame(const Player *p) {
     else if ((right && p->vx < 0) || (!right && p->vx > 0))
         base = right ? 13 : 12;
     else {
-        int step = (p->anim >> 2) & 3;
+        /* $A222 counts 0..11, so (timer & $0C) >> 2 is only 0, 1 or 2.
+         * The fourth step is the other direction's idle, and past that
+         * the jump pose with the arm up. */
+        int step = (p->anim >> 2) % 3;
         base = right ? 1 + step : 5 + step;
     }
     int power = blob_get(p, 0xA216);
