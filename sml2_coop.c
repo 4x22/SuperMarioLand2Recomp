@@ -123,6 +123,14 @@ static int s_plat_x, s_plat_y;
 /* Frames since the carrot glide last reset his fall. 00:1090 refreshes
  * it every 12 frames while A stays held. */
 static int s_flutter_tick;
+/* Frames of the 1px rise left in the water/space speed table, and the
+ * bit-3 space boost ($A2B2, refilled to 50 on the ground). */
+static int s_rise;
+static int s_boost;
+static int s_fluid;
+static int s_swim_pose;
+static int s_swim_anim;
+static int s_step_frame;
 static int s_blob_n;
 static uint16_t s_addr[BLOB_MAX];
 static Regs s_regs;
@@ -260,6 +268,12 @@ static void set_idle(Player *p) {
     blob_set(p, 0xA291, 0);
     p->face = 1;
     s_flutter_tick = 0;
+    if (p == &s_pl[1]) {
+        s_rise = 0;
+        s_boost = 0;
+        s_fluid = 0;
+        s_swim_pose = 0;
+    }
 }
 
 /* Level cells. Rows 0..15 are cart RAM bank 0, 16..31 are WRAM bank 0,
@@ -296,6 +310,18 @@ static int ceiling_tile(int id) {
     return id < 0x38 || id == 0x7E;
 }
 
+/* 00:1E7C walls and 00:1DFE ceilings stop at id $38. Ids $38..$47 are
+ * still floors (00:1E3B stops at $48) but only on the top of the cell:
+ * the floor probe runs when the feet sit in the top five pixels. The
+ * gear teeth are this kind of cell, so the sides have to let him
+ * through or he sticks inside the wheel. */
+static int floor_at(const GBContext *ctx, int x, int feet) {
+    int id = tile_id(ctx, x, feet);
+    if (id < 0x38) return 1;
+    if (id < 0x48) return (feet & 15) < 5;
+    return 0;
+}
+
 static int bump_tile(int id) {
     return id < 4 || id == 0x7E;
 }
@@ -303,14 +329,52 @@ static int bump_tile(int id) {
 static int occupied(const GBContext *ctx, int x, int y) {
     if (x < 0 || x >= 4096) return 1;
     if (y < 0 || y >= 768) return 0;
-    return tile_id(ctx, x, y) < 0x48;
+    return tile_id(ctx, x, y) < 0x38;
 }
 
 /* The picture is centred on x, so the feet samples sit under the square
  * rather than on Mario's probes, which are eight pixels to its right. */
 static int on_floor(const GBContext *ctx, int x, int y) {
     int feet = y + SQUARE_TOP + SQUARE_H;
-    return occupied(ctx, x - 4, feet) || occupied(ctx, x + 4, feet);
+    return floor_at(ctx, x - 4, feet) || floor_at(ctx, x + 4, feet);
+}
+
+/* A fast fall can cross the five-pixel lip of a $38..$47 cell in one
+ * step. Catch the lip he passed instead of dropping through the tooth. */
+static int land_lip(const GBContext *ctx, int x, int prev, int ny, int *out) {
+    int prev_feet = prev + SQUARE_TOP + SQUARE_H;
+    int new_feet = ny + SQUARE_TOP + SQUARE_H;
+    if (new_feet <= prev_feet) return 0;
+    for (int f = prev_feet + 1; f <= new_feet; f++) {
+        if ((f & 15) >= 5) continue;
+        int id_l = tile_id(ctx, x - 4, f);
+        int id_r = tile_id(ctx, x + 4, f);
+        if ((id_l >= 0x38 && id_l < 0x48) || (id_r >= 0x38 && id_r < 0x48)) {
+            int y = (f & ~15) - (SQUARE_TOP + SQUARE_H);
+            if (y < 0) return 0;
+            *out = y;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 00:1BFF. Water is id & $FC == $4C. Tiles $52..$57 are the space
+ * bubbles that set moon bit 1. Sample the middle of the square. */
+static int body_fluid(const GBContext *ctx, int x, int y) {
+    int mid = y + SQUARE_TOP + 8;
+    int low = y + SQUARE_TOP + 14;
+    int samples[4] = {
+        tile_id(ctx, x, mid), tile_id(ctx, x, low),
+        tile_id(ctx, x - 4, low), tile_id(ctx, x + 4, low)
+    };
+    int bubble = 0;
+    for (int i = 0; i < 4; i++) {
+        int id = samples[i];
+        if ((id & 0xFC) == 0x4C) return 1;
+        if (id >= 0x52 && id < 0x58) bubble = 1;
+    }
+    return bubble ? 2 : 0;
 }
 
 /* Actor bytes live in cart RAM. The actor loop may leave a different
@@ -404,9 +468,26 @@ static void step_p2(GBContext *ctx) {
     if (!p->alive || p->hide || (p->x | p->y) == 0) return;
 
     int power = blob_get(p, 0xA216);
+    /* $A287 bits 0 and 3 come from the level (space). Bit 1 is per body,
+     * from a $52..$57 bubble, so Mario's copy is not his. Water wins
+     * over space, matching 00:1BFF which clears the bubble in a pool. */
+    int tile_fluid = body_fluid(ctx, p->x, p->y);
+    int moon = eram_at(ctx, 0xA287) & 0x09;
+    if (tile_fluid == 2) moon |= 0x02;
+    if (tile_fluid == 1) {
+        s_fluid = 1;
+        s_swim_pose = 1;
+    } else if (moon) {
+        s_fluid = 2;
+        s_swim_pose = (moon & 0x02) != 0;
+    } else {
+        s_fluid = 0;
+        s_swim_pose = 0;
+        s_rise = 0;
+    }
     /* 00:14A6. Down on the ground crouches him and 00:1701 then skips
-     * the walk, so he stops where he is. */
-    int duck = p->grounded && (s_held & KEY_DOWN);
+     * the walk, so he stops where he is. In water, down is not a crouch. */
+    int duck = p->grounded && s_fluid != 1 && (s_held & KEY_DOWN);
     if (duck) {
         p->vx = 0;
         blob_set(p, 0xA291, 0xFF);
@@ -416,71 +497,146 @@ static void step_p2(GBContext *ctx) {
 
     if (!duck) {
         int cap = (s_held & KEY_B) ? (2 * PX + PX / 2) : (PX + PX / 2);
+        int accel = 80;
+        if (s_fluid == 1) {
+            cap = PX;
+            accel = 40;
+        } else if (s_fluid == 2) {
+            cap = PX + PX / 2;
+            accel = 60;
+        }
         int target = 0;
         if (s_held & KEY_RIGHT) target = cap;
         else if (s_held & KEY_LEFT) target = -cap;
-        if (p->vx < target) p->vx += 80;
-        if (p->vx > target) p->vx -= 80;
+        if (p->vx < target) p->vx += accel;
+        if (p->vx > target) p->vx -= accel;
         if (p->vx > cap) p->vx = cap;
         if (p->vx < -cap) p->vx = -cap;
         if (target == 0 && p->vx > -40 && p->vx < 40) p->vx = 0;
     }
 
     /* Power 2 is the carrot: on the ground, holding A hops again.
-     * A fresh press is still enough for every other form. */
-    int jumped = p->grounded && (s_pressed & KEY_A);
-    if (power == 2 && p->grounded && (s_held & KEY_A) && !duck) jumped = 1;
-    if (jumped) {
+     * A fresh press is still enough for every other form.
+     * Water (00:160A / MarioSpeedTableVGoo) and space
+     * (MarioSpeedTableVWater) rise at about 1px per frame instead. */
+    int acted = 0;
+    int hold_a = (power == 2 && (s_held & KEY_A)) || (s_pressed & KEY_A);
+    if (s_fluid == 1 && !duck && hold_a) {
+        s_rise = 36;
+        p->vy = -PX;
+        p->grounded = 0;
+        drop_platform();
+        blob_set(p, 0xA291, 0);
+        blob_set(p, 0xA284, 0);
+        s_flutter_tick = 0;
+        acted = 1;
+    } else if (s_fluid == 2 && p->grounded && !duck && hold_a) {
+        s_rise = 48;
+        p->vy = -PX;
+        p->grounded = 0;
+        drop_platform();
+        blob_set(p, 0xA291, 0);
+        blob_set(p, 0xA284, 0);
+        s_flutter_tick = 0;
+        acted = 1;
+    } else if (s_fluid == 0 && p->grounded &&
+               ((s_pressed & KEY_A) || (power == 2 && (s_held & KEY_A) && !duck))) {
         p->vy = -5 * PX;
         p->grounded = 0;
         drop_platform();
         blob_set(p, 0xA291, 0);
         blob_set(p, 0xA284, 0);
         s_flutter_tick = 0;
-    } else if (!p->grounded && s_on_plat < 0) {
-        /* 00:1090. A second press in the air, once the rise has eased,
-         * starts the glide. Holding A refreshes it every 12 frames. */
-        int flutter = 0;
-        if (power == 2 && (s_pressed & KEY_A) && p->vy > -3 * PX) {
-            blob_set(p, 0xA284, 0xFF);
-            s_flutter_tick = 0;
-            p->vy = 0;
-            blob_set(p, 0xA24D, 8);
-        }
-        if (power == 2 && blob_get(p, 0xA284) && (s_held & KEY_A)) {
-            flutter = 1;
-            if (++s_flutter_tick >= 12) {
+        acted = 1;
+    }
+    if (!acted && !p->grounded && s_on_plat < 0) {
+        if (s_fluid == 1) {
+            if (s_rise > 0) {
+                s_rise--;
+                p->vy = -PX;
+            } else {
+                p->vy += 4;
+                if (p->vy > PX / 4) p->vy = PX / 4;
+                if (p->vy < -PX) p->vy = -PX;
+            }
+        } else if (s_fluid == 2) {
+            /* Bit 0 holds a rise. Bit 3 spends the ground fuel. Bit 1
+             * is one stroke per press, the bubble swim. */
+            if ((moon & 0x01) && (s_held & KEY_A))
+                s_rise = 16;
+            else if ((moon & 0x08) && (s_held & KEY_A) && s_boost > 0) {
+                s_boost--;
+                if (s_rise < 20) s_rise += 2;
+            } else if ((moon & 0x02) && (s_pressed & KEY_A))
+                s_rise = 28;
+            if (s_rise > 0) {
+                s_rise--;
+                p->vy = -PX;
+            } else {
+                p->vy += 12;
+                if (p->vy > PX) p->vy = PX;
+                if (p->vy < -2 * PX) p->vy = -2 * PX;
+            }
+        } else {
+            /* 00:1090. A second press in the air, once the rise has eased,
+             * starts the glide. Holding A refreshes it every 12 frames. */
+            int flutter = 0;
+            if (power == 2 && (s_pressed & KEY_A) && p->vy > -3 * PX) {
+                blob_set(p, 0xA284, 0xFF);
                 s_flutter_tick = 0;
                 p->vy = 0;
                 blob_set(p, 0xA24D, 8);
             }
-        } else {
-            blob_set(p, 0xA284, 0);
-            s_flutter_tick = 0;
+            if (power == 2 && blob_get(p, 0xA284) && (s_held & KEY_A)) {
+                flutter = 1;
+                if (++s_flutter_tick >= 12) {
+                    s_flutter_tick = 0;
+                    p->vy = 0;
+                    blob_set(p, 0xA24D, 8);
+                }
+            } else {
+                blob_set(p, 0xA284, 0);
+                s_flutter_tick = 0;
+            }
+            uint8_t hover = blob_get(p, 0xA24D);
+            if (hover) {
+                /* 00:14FA skips the vertical step while this counts down. */
+                blob_set(p, 0xA24D, (uint8_t)(hover - 1));
+            } else {
+                if (p->vy < 0 && !(s_held & KEY_A) && p->vy < -2 * PX)
+                    p->vy = -2 * PX;
+                p->vy += 48;
+                if (p->vy > 4 * PX) p->vy = 4 * PX;
+                if (flutter && p->vy > PX) p->vy = PX;
+            }
         }
-        uint8_t hover = blob_get(p, 0xA24D);
-        if (hover) {
-            /* 00:14FA skips the vertical step while this counts down. */
-            blob_set(p, 0xA24D, (uint8_t)(hover - 1));
-        } else {
-            if (p->vy < 0 && !(s_held & KEY_A) && p->vy < -2 * PX)
-                p->vy = -2 * PX;
-            p->vy += 48;
-            if (p->vy > 4 * PX) p->vy = 4 * PX;
-            if (flutter && p->vy > PX) p->vy = PX;
-        }
-    } else if (p->grounded) {
+    } else if (!acted && p->grounded) {
         blob_set(p, 0xA284, 0);
         s_flutter_tick = 0;
+        s_rise = 0;
+        if (s_fluid == 2 && (moon & 0x08)) s_boost = 50;
         uint8_t hover = blob_get(p, 0xA24D);
         if (hover) blob_set(p, 0xA24D, (uint8_t)(hover - 1));
     }
 
-    p->fx += p->vx;
+    /* 00:12CE. Tiles 4 and 5 are the belts, and the gear teeth use them
+     * so standing on a tooth carries him with the turn. Every other
+     * frame, tile 4 pushes right and tile 5 pushes left. */
+    s_step_frame++;
+    int slide = 0;
+    if (p->grounded && s_on_plat < 0 && (s_step_frame & 1)) {
+        int x0 = p->fx >> 8;
+        int feet = p->y + SQUARE_TOP + SQUARE_H;
+        int id = tile_id(ctx, x0 - 4, feet);
+        if ((id & 0xFE) != 0x04) id = tile_id(ctx, x0 + 4, feet);
+        if ((id & 0xFE) == 0x04) slide = (id == 0x05) ? -1 : 1;
+    }
+    p->fx += p->vx + slide * PX;
     {
         int nx = p->fx >> 8;
         /* First pixel past the drawn edge. The old probes sat to the right. */
-        int edge = p->vx >= 0 ? nx + 8 : nx - 9;
+        int dir = p->vx != 0 ? p->vx : slide;
+        int edge = dir >= 0 ? nx + 8 : nx - 9;
         int mid = p->y + SQUARE_TOP + 4;
         int low = p->y + SQUARE_TOP + 12;
         if (occupied(ctx, edge, mid) || occupied(ctx, edge, low)) {
@@ -501,16 +657,23 @@ static void step_p2(GBContext *ctx) {
             p->vy = 0;
             p->grounded = 1;
         } else if (p->vy >= 0) {
+            int lip = ny;
+            if (!on_floor(ctx, x, ny) && land_lip(ctx, x, prev, ny, &lip)) {
+                ny = lip;
+                p->fy = ny * PX;
+            }
             if (on_floor(ctx, x, ny)) {
                 int guard = 0;
                 while (ny > 0 && on_floor(ctx, x, ny) && guard++ < 32) ny--;
                 p->fy = ny * PX;
                 p->vy = 0;
                 p->grounded = 1;
+                s_rise = 0;
             } else if (on_floor(ctx, x, ny + 1)) {
                 p->fy = ny * PX;
                 p->vy = 0;
                 p->grounded = 1;
+                s_rise = 0;
             } else {
                 p->grounded = 0;
             }
@@ -521,6 +684,7 @@ static void step_p2(GBContext *ctx) {
             if (ceiling_tile(left) || ceiling_tile(right)) {
                 p->fy = prev * PX;
                 p->vy = 0;
+                s_rise = 0;
                 p->grounded = 0;
                 if (bump_tile(left) || bump_tile(right)) {
                     s_bonk = 1;
@@ -537,12 +701,15 @@ static void step_p2(GBContext *ctx) {
     if (s_held & KEY_LEFT) p->face = 0;
     else if (s_held & KEY_RIGHT) p->face = 1;
     if (p->grounded && p->vx) p->anim++;
+    if (s_swim_pose && !p->grounded) s_swim_anim++;
     if (p->y > 740) {
         p->alive = 0;
         p->hide = 0;
         p->respawn = RESPAWN_FRAMES;
         p->vx = p->vy = 0;
         p->grounded = 0;
+        s_rise = 0;
+        s_swim_pose = 0;
         drop_platform();
         return;
     }
@@ -1163,6 +1330,14 @@ static void interact_p2(GBContext *ctx) {
     save_regs(ctx);
     remember_keys(ctx);
     save_player(ctx, &s_pl[s_lead]);
+    /* $A287 is the shared water/space flag (bit 1 = swimming). 00:1BFF
+     * rewrites it from whoever is in the registers, and leaving water
+     * forces vertical index 70, which is a rise. Player 2 sampling a
+     * pool was arming that launch on player 1 every frame, so Mario
+     * pinned himself to the ceiling. Keep player 1's flag. */
+    uint8_t moon = eram_at(ctx, 0xA287);
+    uint8_t goo = eram_at(ctx, 0xA26D);
+    uint8_t goo_prev = eram_at(ctx, 0xA27B);
     s_lock_p2 = 1;
     give_p2_keys(ctx);
     load_player(ctx, p);
@@ -1250,6 +1425,9 @@ static void interact_p2(GBContext *ctx) {
     } else {
         stick_platform(ctx, p);
     }
+    eram_put(ctx, 0xA287, moon);
+    eram_put(ctx, 0xA26D, goo);
+    eram_put(ctx, 0xA27B, goo_prev);
     if (p->alive) shoot_fireball(ctx, p);
     if (killed) {
         /* 00:2D7D queues the death jingle in $A460. That replaces the
@@ -1516,7 +1694,11 @@ static int mario_frame(const Player *p) {
     int duck = p->grounded && blob_get(p, 0xA291);
     if (duck)
         base = right ? 14 : 15;
-    else if (!p->grounded)
+    else if (!p->grounded && s_swim_pose) {
+        /* 01:532D. Moon bit 1, and the pool, use the swim pair. */
+        int kick = (s_swim_anim >> 3) & 1;
+        base = right ? 18 + kick : 20 + kick;
+    } else if (!p->grounded)
         base = p->vy < 0 ? (right ? 8 : 9) : (right ? 10 : 11);
     else if (p->vx > -40 && p->vx < 40)
         base = right ? 0 : 4;
